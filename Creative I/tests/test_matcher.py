@@ -4,9 +4,17 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from unittest.mock import Mock
+import pytest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from src.contractor_matcher import Contractor, Request, explain, match
+from src.contractor_matcher import load_catalog
+
+
+@pytest.fixture(autouse=True)
+def no_real_api(monkeypatch):
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
 
 
 def c(id, **kw):
@@ -93,7 +101,7 @@ def test_explain_api_failure_returns_fallback_without_raising():
             raise RuntimeError("network unavailable")
 
     class FakeOpenAI:
-        def __init__(self):
+        def __init__(self, **kwargs):
             self.responses = FailingResponses()
 
     candidate = {
@@ -105,3 +113,50 @@ def test_explain_api_failure_returns_fallback_without_raising():
         result = explain(candidate, request(language="английский"), cache_dir)
     assert "Ведущий 1" in result["reason"]
     assert "английский" in result["reason"]
+
+
+def test_real_catalog_and_repeatability():
+    catalog = load_catalog(Path(__file__).parents[1] / 'data/contractors.csv')
+    assert len(catalog) == 66
+    assert sum(c.synthetic for c in catalog) == 13
+    query = request(budget_kzt=2000000)
+    results = [match(query, catalog, offline=True) for _ in range(3)]
+    assert [[m['id'] for m in r.matches] for r in results] == [['HK-72938', 'HK-88430', 'HK-75012']] * 3
+    assert all(m['reason'] for m in results[0].matches)
+    assert len({m['reason'] for m in results[0].matches}) == 3
+    other = match(request(budget_kzt=2000000, date='2026-10-11'), catalog, offline=True)
+    assert [m['id'] for m in other.matches] == ['HK-72938', 'HK-77838', 'HK-44923']
+    assert 'HK-88430' in other.excluded['busy']
+    assert 'занятости' in other.message
+
+
+def test_null_duration_does_not_exclude():
+    assert match(request(duration_hours=20), [c('1', max_hours=None)]).status == 'matched'
+
+
+def test_successful_api_cache_and_corrupt_cache_recovery(tmp_path, monkeypatch):
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+    client = Mock()
+    client.responses.create.return_value.output_text = '```json\n{"reason":"Провёл 200 корпоративов."}\n```'
+    factory = Mock(return_value=client)
+    candidate = {'anon_name': '1', 'price_from_kzt': 100000, 'description': 'Провёл 200 корпоративов.'}
+    with patch.dict(sys.modules, {'openai': SimpleNamespace(OpenAI=factory)}):
+        first = explain(candidate, request(), tmp_path)
+        assert explain(candidate, request(), tmp_path) == first
+        assert client.responses.create.call_count == 1
+        factory.assert_called_once_with(timeout=2.0, max_retries=0)
+        next(tmp_path.glob('*.json')).write_text('broken', encoding='utf-8')
+        assert explain(candidate, request(), tmp_path) == first
+        assert client.responses.create.call_count == 2
+
+
+def test_failure_not_cached_and_recovery_retries(tmp_path, monkeypatch):
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+    client = Mock()
+    client.responses.create.side_effect = [RuntimeError('network'), SimpleNamespace(output_text='{"reason":"Вёл 100 событий."}')]
+    candidate = {'anon_name': '1', 'price_from_kzt': 100000, 'description': 'Вёл 100 событий.'}
+    with patch.dict(sys.modules, {'openai': SimpleNamespace(OpenAI=Mock(return_value=client))}):
+        assert '100 000' in explain(candidate, request(), tmp_path)['reason']
+        assert not list(tmp_path.glob('*.json'))
+        assert explain(candidate, request(), tmp_path)['reason'] == 'Вёл 100 событий.'
+        assert client.responses.create.call_count == 2
